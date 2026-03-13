@@ -1,0 +1,88 @@
+import requests
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import List
+
+OSRM_BASE = "http://router.project-osrm.org"
+
+def osrm_route_duration(coords):
+    joined = ";".join(f"{lon},{lat}" for lat, lon in coords)
+    url = f"{OSRM_BASE}/route/v1/driving/{joined}?overview=false"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    return int(r.json()["routes"][0]["duration"])
+
+from typing import List, Tuple
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    import math
+    r = 6371000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+def greedy_resequence(current_lat: float, current_lon: float, stops) -> List[str]:
+    """
+    Greedy nearest-next resequencing.
+    Input stops: list of Stop(pydantic) with stop_id + location(lat,lon)
+    Output: list of stop_id in new order
+    """
+    remaining = list(stops)
+    order: List[str] = []
+    cur_lat, cur_lon = current_lat, current_lon
+
+    while remaining:
+        best_i = 0
+        best_d = float("inf")
+        for i, s in enumerate(remaining):
+            d = haversine_m(cur_lat, cur_lon, s.location.lat, s.location.lon)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        picked = remaining.pop(best_i)
+        order.append(picked.stop_id)
+        cur_lat, cur_lon = picked.location.lat, picked.location.lon
+
+    return order
+
+
+app = FastAPI()
+
+class Location(BaseModel):
+    lat: float
+    lon: float
+
+class Stop(BaseModel):
+    stop_id: str
+    location: Location
+
+class RouteRequest(BaseModel):
+    vehicle_id: str
+    current_location: Location
+    stops: List[Stop]
+    traffic_multiplier: float = 1.0
+
+@app.post("/route/evaluate")
+def evaluate_route(req: RouteRequest):
+    # 1) compute a new stop order (RESEQUENCE)
+    stop_order = greedy_resequence(
+        req.current_location.lat,
+        req.current_location.lon,
+        req.stops
+    )
+
+    # 2) build coords in that new order to get "real ETA"
+    stop_by_id = {s.stop_id: s for s in req.stops}
+    coords = [(req.current_location.lat, req.current_location.lon)] + [
+        (stop_by_id[sid].location.lat, stop_by_id[sid].location.lon) for sid in stop_order
+    ]
+
+    base_eta_sec = osrm_route_duration(coords)
+    total_eta_sec = int(base_eta_sec * req.traffic_multiplier)
+
+    return {
+        "total_eta_sec": total_eta_sec,
+        "stop_order": stop_order
+    }

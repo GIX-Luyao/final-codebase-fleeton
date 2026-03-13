@@ -1,0 +1,120 @@
+import json
+import os
+import urllib.request
+import urllib.error
+
+
+ROUTING_ENGINE_URL = os.environ.get(
+    "ROUTING_ENGINE_URL",
+    "http://172.30.1.180:8000/route/evaluate"  # you said routing engine currently on 8000
+)
+
+REROUTE_THRESHOLD = float(os.environ.get("REROUTE_THRESHOLD", "0.10"))
+DEFAULT_TRAFFIC_MULTIPLIER = float(os.environ.get("DEFAULT_TRAFFIC_MULTIPLIER", "1.15"))
+ROUTING_TIMEOUT_SEC = int(os.environ.get("ROUTING_TIMEOUT_SEC", "8"))
+
+
+def http_post_json(url: str, payload: dict, timeout_sec: int = 8) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url=url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body)
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"HTTPError {e.code}: {err_body}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"URLError: {e.reason}") from e
+
+
+def _unwrap_input(event: dict) -> dict:
+    """
+    Supports:
+    - API Gateway HTTP API (v2) proxy event: payload in event["body"] (string)
+    - Direct invoke: payload already in event
+    """
+    if isinstance(event, dict) and "body" in event and isinstance(event["body"], str):
+        try:
+            return json.loads(event["body"])
+        except json.JSONDecodeError:
+            # If body isn't JSON, fall back to raw event
+            return event
+    return event
+
+
+def _normalize_stops(stops_raw):
+    out = []
+    for s in (stops_raw or []):
+        stop_id = s.get("stop_id") or s.get("id") or "UNKNOWN"
+        loc = s.get("location") or {}
+        lat = loc.get("lat") if "lat" in loc else s.get("lat")
+        lon = loc.get("lon") if "lon" in loc else s.get("lon")
+        if lat is None or lon is None:
+            raise ValueError(f"Stop missing lat/lon: {s}")
+        out.append({"stop_id": stop_id, "location": {"lat": float(lat), "lon": float(lon)}})
+    return out
+
+
+def lambda_handler(event, context):
+    print("Incoming event:", json.dumps(event))
+
+    inp = _unwrap_input(event)
+    print("Parsed input:", json.dumps(inp))
+
+    vehicle_id = inp.get("vehicle_id", "TRUCK_001")
+    current_location = inp.get("location") or {"lat": 47.6062, "lon": -122.3321}
+    eta_current = int(inp.get("eta_sec", 1800))
+
+    stops = _normalize_stops(inp.get("remaining_stops")) or [
+        {"stop_id": "STOP_1", "location": {"lat": 47.2529, "lon": -122.4443}}
+    ]
+
+    mode = "RESEQUENCE" if inp.get("requires_reorder") else "KEEP_SEQUENCE"
+    traffic_multiplier = float(inp.get("traffic_multiplier", DEFAULT_TRAFFIC_MULTIPLIER))
+
+    payload = {
+        "vehicle_id": vehicle_id,
+        "candidate_id": "cand_keep_sequence",
+        "current_location": current_location,
+        "stops": stops,
+        "mode": mode,
+        "traffic_multiplier": traffic_multiplier,
+    }
+
+    print("Routing engine URL:", ROUTING_ENGINE_URL)
+    print("Routing request payload:", json.dumps(payload))
+
+    route_data = http_post_json(ROUTING_ENGINE_URL, payload, timeout_sec=ROUTING_TIMEOUT_SEC)
+
+    eta_if_reroute = int(route_data["total_eta_sec"])
+    stop_order = route_data.get("stop_order")
+
+    improvement_pct = (eta_current - eta_if_reroute) / max(1, eta_current)
+    decision = "REROUTE" if (improvement_pct >= REROUTE_THRESHOLD and eta_if_reroute < eta_current) else "NOOP"
+    reason_code = "IMPROVEMENT_GE_THRESHOLD" if decision == "REROUTE" else "IMPROVEMENT_LT_THRESHOLD"
+
+    result = {
+        "vehicle_id": vehicle_id,
+        "mode": mode,
+        "eta_current": eta_current,
+        "eta_if_reroute": eta_if_reroute,
+        "improvement_pct": round(improvement_pct, 4),
+        "decision": decision,
+        "reason_code": reason_code,
+        "stop_order": stop_order,
+    }
+
+    print("Decision result:", json.dumps(result))
+
+    # If invoked via API Gateway, return proper proxy response
+    if isinstance(event, dict) and "requestContext" in event:
+        return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(result)}
+
+    # Direct invoke
+    return result

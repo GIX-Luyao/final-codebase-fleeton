@@ -1,0 +1,385 @@
+import os, json, time
+from datetime import datetime, timezone
+
+import psycopg2
+import psycopg2.extras
+
+DB_HOST = os.environ["DB_HOST"]
+DB_PORT = int(os.environ.get("DB_PORT", "5432"))
+DB_NAME = os.environ["DB_NAME"]
+DB_USER = os.environ["DB_USER"]
+DB_PASSWORD = os.environ["DB_PASSWORD"]
+DB_SSLMODE = os.environ.get("DB_SSLMODE", "require")
+
+MAX_WAIT_S = 25
+DEFAULT_WAIT_S = 20
+POLL_INTERVAL_MS = 800
+
+
+def _resp(status, body):
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET,OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
+        },
+        "body": json.dumps(body, default=str),
+    }
+
+
+def _parse_iso8601_to_naive_utc(s: str) -> datetime:
+    s = (s or "").strip()
+    if not s:
+        raise ValueError("empty datetime")
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _naive_utc_to_iso_z(dt: datetime) -> str:
+    if not dt:
+        return None
+    return dt.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _build_incident_description(row: dict) -> str:
+    parts = []
+    et = row.get("event_type")
+    sev = row.get("severity")
+    if et and sev:
+        parts.append(f"{et} ({sev})")
+    elif et:
+        parts.append(str(et))
+
+    gps_speed = row.get("gps_speed")
+    if gps_speed is not None:
+        parts.append(f"gps_speed={gps_speed}")
+
+    engine_status = row.get("engine_status")
+    if engine_status:
+        parts.append(f"engine={engine_status}")
+
+    dtc = row.get("dtc_codes") or []
+    if dtc:
+        parts.append(f"dtc={','.join(dtc)}")
+
+    eta_impact = row.get("eta_impact_min")
+    if eta_impact is not None:
+        parts.append(f"eta_impact={eta_impact}min")
+
+    return " | ".join(parts) if parts else "Incident detected"
+
+
+def _fetch_one_new_incident(cur, vehicle_id, after_dt, after_id):
+    cur.execute(
+        """
+        SELECT
+          i.incident_id,
+          i.vehicle_id,
+          i.event_type,
+          i.severity,
+          i.start_time,
+          i.end_time,
+          i.location,
+          ST_Y(i.location::geometry) AS lat,
+          ST_X(i.location::geometry) AS lon,
+          i.gps_speed,
+          i.engine_status,
+          i.dtc_codes,
+          i.eta_impact_min,
+          i.requires_reorder
+        FROM incidents i
+        WHERE i.vehicle_id = %s
+          AND (i.start_time, i.incident_id) > (%s, %s)
+        ORDER BY i.start_time ASC, i.incident_id ASC
+        LIMIT 1;
+        """,
+        (vehicle_id, after_dt, after_id),
+    )
+    return cur.fetchone()
+
+
+def _fetch_vehicle_status(cur, vehicle_id):
+    cur.execute(
+        """
+        SELECT
+          v.vehicle_id,
+          v.status,
+          v.last_location,
+          ST_Y(v.last_location::geometry) AS last_lat,
+          ST_X(v.last_location::geometry) AS last_lon,
+          v.last_update_at
+        FROM vehicles v
+        WHERE v.vehicle_id = %s
+        LIMIT 1;
+        """,
+        (vehicle_id,),
+    )
+    return cur.fetchone()
+
+
+def _fetch_active_plan_id(cur, vehicle_id):
+    cur.execute(
+        """
+        SELECT plan_id
+        FROM delivery_plans
+        WHERE vehicle_id = %s
+          AND status = 'ACTIVE'
+        ORDER BY created_at DESC
+        LIMIT 1;
+        """,
+        (vehicle_id,),
+    )
+    row = cur.fetchone()
+    return row["plan_id"] if row else None
+
+
+def _fetch_original_task_sequence(cur, plan_id):
+    """
+    Stops in ORIGINAL order (baseline), with:
+    - lat/lon from PostGIS
+    - status
+    - address (TEXT) if present
+    """
+    cur.execute(
+        """
+        SELECT
+          s.stop_id,
+          s.original_sequence,
+          s.planned_time_start,
+          s.planned_time_end,
+          s.status,
+          s.address,
+          ST_Y(s.location::geometry) AS lat,
+          ST_X(s.location::geometry) AS lon
+        FROM delivery_stops s
+        WHERE s.plan_id = %s
+        ORDER BY s.original_sequence ASC;
+        """,
+        (plan_id,),
+    )
+    return cur.fetchall() or []
+
+
+def _fetch_current_task_sequence(cur, plan_id):
+    """
+    Stops in CURRENT order (after reroute), ordered by current_sequence.
+    """
+    cur.execute(
+        """
+        SELECT
+          s.stop_id,
+          s.current_sequence,
+          s.planned_time_start,
+          s.planned_time_end,
+          s.status,
+          s.address,
+          ST_Y(s.location::geometry) AS lat,
+          ST_X(s.location::geometry) AS lon
+        FROM delivery_stops s
+        WHERE s.plan_id = %s
+        ORDER BY s.current_sequence ASC NULLS LAST, s.original_sequence ASC;
+        """,
+        (plan_id,),
+    )
+    return cur.fetchall() or []
+
+
+def _fetch_latest_reroute_result(cur, plan_id):
+    """
+    Latest persisted reroute result (survives simulator restore).
+    Table schema (you provided):
+      stop_resequence_results(
+        result_id uuid PK default gen_random_uuid(),
+        plan_id text,
+        incident_id uuid,
+        old_sequence jsonb,
+        new_sequence jsonb,
+        created_at timestamptz default now()
+      )
+    """
+    cur.execute(
+        """
+        SELECT
+          r.result_id,
+          r.plan_id,
+          r.incident_id,
+          r.old_sequence,
+          r.new_sequence,
+          r.created_at
+        FROM stop_resequence_results r
+        WHERE r.plan_id = %s
+        ORDER BY r.created_at DESC
+        LIMIT 1;
+        """,
+        (plan_id,),
+    )
+    return cur.fetchone()
+
+
+def _to_location(lat, lon):
+    return {
+        "lat": float(lat) if lat is not None else None,
+        "lon": float(lon) if lon is not None else None,
+    }
+
+
+def lambda_handler(event, context):
+    method = (event.get("requestContext", {}).get("http", {}) or {}).get("method")
+    if method == "OPTIONS":
+        return _resp(200, {"ok": True})
+
+    qs = event.get("queryStringParameters") or {}
+    vehicle_id = qs.get("vehicle_id")
+    after_time = qs.get("after_time")
+    after_id = qs.get("after_id")
+    wait_s_raw = qs.get("wait_s", str(DEFAULT_WAIT_S))
+
+    if not vehicle_id:
+        return _resp(400, {"error": "vehicle_id is required"})
+    if not (after_time and after_id):
+        return _resp(400, {"error": "after_time and after_id are required for long polling"})
+
+    try:
+        after_dt = _parse_iso8601_to_naive_utc(after_time)
+    except Exception:
+        return _resp(400, {"error": "after_time must be ISO8601, e.g. 2026-01-21T01:11:18Z"})
+
+    try:
+        wait_s = int(wait_s_raw)
+        wait_s = max(0, min(wait_s, MAX_WAIT_S))
+    except ValueError:
+        return _resp(400, {"error": "wait_s must be an integer"})
+
+    deadline = time.time() + wait_s
+    conn = None
+
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            sslmode=DB_SSLMODE,
+        )
+
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            while True:
+                inc = _fetch_one_new_incident(cur, vehicle_id, after_dt, after_id)
+
+                if inc:
+                    st = inc.get("start_time")
+                    et = inc.get("end_time")
+
+                    # vehicle status
+                    v = _fetch_vehicle_status(cur, vehicle_id) or {}
+
+                    # active plan
+                    plan_id = _fetch_active_plan_id(cur, vehicle_id)
+
+                    # stops: original + current
+                    stops_original = _fetch_original_task_sequence(cur, plan_id) if plan_id else []
+                    stops_current = _fetch_current_task_sequence(cur, plan_id) if plan_id else []
+
+                    # latest reroute record (persistent)
+                    latest_reroute = _fetch_latest_reroute_result(cur, plan_id) if plan_id else None
+
+                    original_task_sequence = []
+                    for s in stops_original:
+                        original_task_sequence.append({
+                            "task_id": s["stop_id"],
+                            "order": s["original_sequence"],
+                            "planned_time_start": _naive_utc_to_iso_z(s.get("planned_time_start")),
+                            "planned_time_end": _naive_utc_to_iso_z(s.get("planned_time_end")),
+                            "status": s.get("status"),
+                            "address": s.get("address"),
+                            "location": _to_location(s.get("lat"), s.get("lon")),
+                        })
+
+                    current_task_sequence = []
+                    for s in stops_current:
+                        current_task_sequence.append({
+                            "task_id": s["stop_id"],
+                            "order": s.get("current_sequence"),
+                            "planned_time_start": _naive_utc_to_iso_z(s.get("planned_time_start")),
+                            "planned_time_end": _naive_utc_to_iso_z(s.get("planned_time_end")),
+                            "status": s.get("status"),
+                            "address": s.get("address"),
+                            "location": _to_location(s.get("lat"), s.get("lon")),
+                        })
+
+                    incident_obj = {
+                        "incident_id": inc["incident_id"],
+                        "vehicle_id": inc["vehicle_id"],
+                        "event_type": inc.get("event_type"),
+                        "severity": inc.get("severity"),
+                        "timestamp": _naive_utc_to_iso_z(st),
+                        "start_time": _naive_utc_to_iso_z(st),
+                        "end_time": _naive_utc_to_iso_z(et),
+                        "reason": None,
+                        "description": _build_incident_description(inc),
+                        "requires_reorder": inc.get("requires_reorder"),
+                        "eta_impact_min": inc.get("eta_impact_min"),
+                        "location": _to_location(inc.get("lat"), inc.get("lon")),
+                        "gps_speed": inc.get("gps_speed"),
+                        "engine_status": inc.get("engine_status"),
+                        "dtc_codes": inc.get("dtc_codes") or [],
+                        "source": "backend",
+                    }
+
+                    vehicle_status_obj = {
+                        "vehicle_id": v.get("vehicle_id", vehicle_id),
+                        "status": v.get("status"),
+                        "last_location": _to_location(v.get("last_lat"), v.get("last_lon")),
+                        "last_update_at": _naive_utc_to_iso_z(v.get("last_update_at")) if v.get("last_update_at") else None,
+                        "active_plan_id": plan_id,
+                    }
+
+                    latest_reroute_obj = None
+                    if latest_reroute:
+                        # old_sequence/new_sequence are jsonb -> psycopg2 returns Python types already
+                        latest_reroute_obj = {
+                            "result_id": str(latest_reroute.get("result_id")) if latest_reroute.get("result_id") else None,
+                            "plan_id": latest_reroute.get("plan_id"),
+                            "incident_id": str(latest_reroute.get("incident_id")) if latest_reroute.get("incident_id") else None,
+                            "old_sequence": latest_reroute.get("old_sequence"),
+                            "new_sequence": latest_reroute.get("new_sequence"),
+                            "created_at": latest_reroute.get("created_at").isoformat() if latest_reroute.get("created_at") else None,
+                        }
+
+                    payload = {
+                        "incident": incident_obj,
+                        "vehicle_status": vehicle_status_obj,
+
+                        # baseline order
+                        "original_task_sequence": original_task_sequence,
+
+                        # NEW: reroute-after order from delivery_stops.current_sequence
+                        "current_task_sequence": current_task_sequence,
+
+                        # NEW: persistent reroute record (survives simulator restore)
+                        "latest_reroute": latest_reroute_obj,
+                    }
+
+                    return _resp(200, {
+                        "item": payload,
+                        "next_after_time": _naive_utc_to_iso_z(st) if st else after_time,
+                        "next_after_id": inc["incident_id"],
+                    })
+
+                if time.time() >= deadline:
+                    return _resp(200, {"item": None, "next_after_time": None, "next_after_id": None})
+
+                time.sleep(POLL_INTERVAL_MS / 1000.0)
+
+    except Exception as e:
+        return _resp(500, {"error": "internal_error", "detail": str(e)})
+    finally:
+        if conn:
+            conn.close()

@@ -1,0 +1,154 @@
+import os
+import json
+import time
+import logging
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Matches your table schema:
+# vehicle_latest_location(
+#   vehicle_id TEXT PK,
+#   lat DOUBLE PRECISION,
+#   lon DOUBLE PRECISION,
+#   speed_mps DOUBLE PRECISION,
+#   heading_deg DOUBLE PRECISION,
+#   client_timestamp TIMESTAMPTZ,
+#   server_received_at TIMESTAMPTZ,
+#   seq BIGINT
+# )
+READ_SQL = """
+SELECT
+  vehicle_id,
+  lat,
+  lon,
+  speed_mps,
+  heading_deg,
+  client_timestamp,
+  server_received_at,
+  seq
+FROM vehicle_latest_location
+WHERE vehicle_id = %s
+LIMIT 1;
+"""
+
+
+def _resp(code: int, body: dict):
+    return {
+        "statusCode": code,
+        "headers": {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "access-control-allow-methods": "GET,OPTIONS",
+            "access-control-allow-headers": "content-type",
+        },
+        "body": json.dumps(body),
+    }
+
+
+def _db_conn():
+    return psycopg2.connect(
+        host=os.environ["DB_HOST"],
+        port=int(os.environ.get("DB_PORT", "5432")),
+        dbname=os.environ["DB_NAME"],
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        connect_timeout=5,
+    )
+
+
+def lambda_handler(event, context):
+    # Compatible with HTTP API v2 + REST API
+    method = (
+        (event.get("requestContext") or {}).get("http", {}).get("method")
+        or event.get("httpMethod")
+        or "GET"
+    )
+
+    if method.upper() == "OPTIONS":
+        return _resp(200, {"ok": True})
+
+    qs = event.get("queryStringParameters") or {}
+    path_params = event.get("pathParameters") or {}
+
+    # Support both:
+    # - GET /location?vehicle_id=TRUCK_001
+    # - GET /location/TRUCK_001  (if you later change route to /location/{vehicle_id})
+    vehicle_id = (
+        qs.get("vehicle_id")
+        or qs.get("id")
+        or path_params.get("vehicle_id")
+        or path_params.get("id")
+    )
+
+    if not vehicle_id:
+        return _resp(
+            400,
+            {
+                "ok": False,
+                "error": "missing vehicle_id. Use ?vehicle_id=TRUCK_001 (or /location/{vehicle_id})",
+            },
+        )
+
+    stale_threshold_sec = int(os.environ.get("STALE_THRESHOLD_SEC", "10"))
+
+    t0 = time.time()
+    try:
+        conn = _db_conn()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(READ_SQL, (vehicle_id,))
+                row = cur.fetchone()
+        finally:
+            conn.close()
+
+        if not row:
+            return _resp(
+                404,
+                {"ok": False, "error": "no recent location", "vehicle_id": vehicle_id},
+            )
+
+        server_received_at = row.get("server_received_at")
+        age_sec = None
+        stale = False
+        if server_received_at:
+            age_sec = time.time() - server_received_at.timestamp()
+            stale = age_sec > stale_threshold_sec
+
+        return _resp(
+            200,
+            {
+                "ok": True,
+                "vehicle_id": row["vehicle_id"],
+                "location": {
+                    "lat": float(row["lat"]),
+                    "lon": float(row["lon"]),
+                    # Stored as m/s in DB; keep naming explicit
+                    "speed_mps": row.get("speed_mps"),
+                    "heading_deg": row.get("heading_deg"),
+                },
+                "client_timestamp": row.get("client_timestamp").isoformat() if row.get("client_timestamp") else None,
+                "server_received_at": server_received_at.isoformat() if server_received_at else None,
+                "age_sec": round(age_sec, 3) if age_sec is not None else None,
+                "stale": stale,
+                "seq": row.get("seq"),
+                "meta": {
+                    "request_id": getattr(context, "aws_request_id", None),
+                    "latency_ms": round((time.time() - t0) * 1000, 1),
+                },
+            },
+        )
+
+    except Exception as e:
+        logger.exception("READ_LOCATION_FAILED vehicle_id=%s err=%r", vehicle_id, e)
+        return _resp(
+            500,
+            {
+                "ok": False,
+                "error": "db_failed",
+                "detail": f"{type(e).__name__}: {e}",
+                "vehicle_id": vehicle_id,
+            },
+        )

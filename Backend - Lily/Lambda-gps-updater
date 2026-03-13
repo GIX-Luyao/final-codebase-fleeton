@@ -1,0 +1,374 @@
+import os
+import json
+import uuid
+import time
+import logging
+
+import psycopg2
+import boto3
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+lambda_client = boto3.client("lambda")
+
+
+def _parse_body(event: dict) -> dict:
+    """Parse API Gateway proxy body -> dict."""
+    if not isinstance(event, dict):
+        return {}
+
+    body = event.get("body")
+    if body is None:
+        return {}
+
+    if isinstance(body, dict):
+        return body
+
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            body = body.decode("utf-8")
+        except Exception:
+            return {}
+
+    if isinstance(body, str):
+        try:
+            return json.loads(body)
+        except Exception:
+            return {}
+
+    return {}
+
+
+def _db_conn():
+    """Open Postgres connection using Lambda env vars."""
+    host = os.environ["DB_HOST"]
+    port = int(os.environ.get("DB_PORT", "5432"))
+    dbname = os.environ["DB_NAME"]
+    user = os.environ["DB_USER"]
+    password = os.environ["DB_PASSWORD"]
+
+    logger.info("DB target host=%s port=%s db=%s user=%s", host, port, dbname, user)
+    return psycopg2.connect(
+        host=host,
+        port=port,
+        dbname=dbname,
+        user=user,
+        password=password,
+        connect_timeout=5,
+    )
+
+
+def _bool_or_false(v) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "t", "yes", "y")
+    return False
+
+
+def _parse_ts_epoch(payload: dict) -> float:
+    """Simulator provides epoch seconds; fallback to now()."""
+    ts = payload.get("timestamp", time.time())
+    if isinstance(ts, str):
+        try:
+            ts = float(ts)
+        except Exception:
+            ts = time.time()
+    try:
+        return float(ts)
+    except Exception:
+        return float(time.time())
+
+
+def _forward_to_event_processor(forward_event: dict, incident_id: str) -> None:
+    """Async invoke downstream processor (reroute pipeline)."""
+    fn_name = os.environ.get("EVENT_PROCESSOR_LAMBDA", "event-processing-dev")
+
+    t0 = time.time()
+    logger.info("FORWARD_BEGIN incident_id=%s fn=%s", incident_id, fn_name)
+    try:
+        lambda_client.invoke(
+            FunctionName=fn_name,
+            InvocationType="Event",
+            Payload=json.dumps(forward_event).encode("utf-8"),
+        )
+        logger.info("FORWARD_OK incident_id=%s cost_ms=%.1f", incident_id, (time.time() - t0) * 1000)
+    except Exception as e:
+        logger.exception(
+            "FORWARD_FAILED incident_id=%s cost_ms=%.1f err_type=%s err=%r",
+            incident_id, (time.time() - t0) * 1000, type(e).__name__, e
+        )
+
+
+# -----------------------------------------------------------------------------
+# REALTIME LOCATION UPSERT (matches your pgAdmin table: vehicle_latest_location)
+# Columns: vehicle_id, lat, lon, speed_mps, heading_deg, client_timestamp,
+#          server_received_at, seq
+# Simulator fields:
+# - location.lat/lon (or latitude/longitude)
+# - speed (km/h) -> convert to m/s
+# - heading (deg)
+# - timestamp (epoch seconds) -> to_timestamp()
+# -----------------------------------------------------------------------------
+UPSERT_LATEST_LOCATION_SQL = """
+INSERT INTO vehicle_latest_location (
+    vehicle_id,
+    lat,
+    lon,
+    speed_mps,
+    heading_deg,
+    client_timestamp,
+    seq,
+    server_received_at
+) VALUES (
+    %s, %s, %s,
+    %s, %s,
+    to_timestamp(%s),
+    %s,
+    NOW()
+)
+ON CONFLICT (vehicle_id) DO UPDATE SET
+    lat = EXCLUDED.lat,
+    lon = EXCLUDED.lon,
+    speed_mps = EXCLUDED.speed_mps,
+    heading_deg = EXCLUDED.heading_deg,
+    client_timestamp = EXCLUDED.client_timestamp,
+    seq = EXCLUDED.seq,
+    server_received_at = NOW()
+;
+"""
+
+
+INCIDENT_UPSERT_SQL = """
+INSERT INTO incidents (
+    incident_id, vehicle_id, event_type, severity,
+    location, gps_speed, engine_status, dtc_codes,
+    eta_impact_min, requires_reorder,
+    start_time, end_time
+) VALUES (
+    %s, %s, %s, %s,
+    ST_SetSRID(ST_MakePoint(%s, %s), 4326),
+    %s, %s, %s,
+    %s, %s,
+    to_timestamp(%s), to_timestamp(%s)
+)
+ON CONFLICT (incident_id) DO UPDATE SET
+    severity = EXCLUDED.severity,
+    location = EXCLUDED.location,
+    gps_speed = EXCLUDED.gps_speed,
+    engine_status = EXCLUDED.engine_status,
+    dtc_codes = EXCLUDED.dtc_codes,
+    eta_impact_min = EXCLUDED.eta_impact_min,
+    requires_reorder = EXCLUDED.requires_reorder,
+    end_time = EXCLUDED.end_time;
+"""
+
+
+def lambda_handler(event, context):
+    logger.info(
+        "HIT_LAMBDA function=%s request_id=%s",
+        os.environ.get("AWS_LAMBDA_FUNCTION_NAME"),
+        getattr(context, "aws_request_id", None),
+    )
+
+    payload = _parse_body(event)
+
+    vehicle_id = payload.get("vehicle_id")
+
+    # incident fields (optional)
+    event_type = payload.get("event_type")            # e.g. "ROUTE_MISMATCH" or None
+    severity = payload.get("event_severity")          # "LOW/MEDIUM/HIGH" or None
+    eta_impact_min = payload.get("eta_impact_min")    # int or None
+    requires_reorder = _bool_or_false(payload.get("requires_reorder"))
+    engine_status = payload.get("engine_status")
+    dtc_codes = payload.get("DTC_codes") or []
+
+    # Prefer payload["location"], fallback to latitude/longitude
+    loc = payload.get("location") or {}
+    lat = loc.get("lat", payload.get("latitude"))
+    lon = loc.get("lon", payload.get("longitude"))
+
+    # Simulator: heading may be "heading" (deg)
+    heading = payload.get("heading_deg") or payload.get("heading")
+    seq = payload.get("seq", 0)  # optional
+    ts = _parse_ts_epoch(payload)
+
+    # Simulator: speed is km/h. Convert to m/s for vehicle_latest_location.speed_mps
+    speed_kmh = payload.get("speed")
+    speed_mps = None
+    try:
+        if speed_kmh is not None:
+            speed_mps = float(speed_kmh) / 3.6
+    except Exception:
+        speed_mps = None
+
+    logger.info(
+        "payload vehicle_id=%s event_type=%s severity=%s lat=%s lon=%s speed_kmh=%s",
+        vehicle_id, event_type, severity, lat, lon, speed_kmh
+    )
+
+    if not (vehicle_id and lat is not None and lon is not None):
+        return {
+            "ok": False,
+            "error": "missing required fields for location upsert",
+            "vehicle_id": vehicle_id,
+            "lat": lat,
+            "lon": lon,
+        }
+
+    # --- Always upsert latest location ---
+    location_saved = False
+    location_err = None
+
+    # We'll keep one DB connection for both location + incident (if any)
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            # Latest location (lat/lon are stored as floats)
+            cur.execute(
+                UPSERT_LATEST_LOCATION_SQL,
+                (
+                    vehicle_id,
+                    float(lat),
+                    float(lon),
+                    speed_mps,  # m/s
+                    float(heading) if heading is not None else None,
+                    ts,  # epoch sec -> to_timestamp()
+                    int(seq) if seq is not None else 0,
+                ),
+            )
+        conn.commit()
+        location_saved = True
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        location_err = f"{type(e).__name__}: {e}"
+        logger.exception("LATEST_LOCATION_UPSERT_FAILED %s", location_err)
+    finally:
+        # don't close yet if we need incident insert; we'll reopen if necessary
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = None
+
+    # If no incident event, return now (realtime location only)
+    if not event_type:
+        return {
+            "ok": True,
+            "skipped": "no_event",
+            "vehicle_id": vehicle_id,
+            "location_saved": location_saved,
+            "location_error": location_err,
+        }
+
+    # --- Incident flow (only when event_type exists) ---
+    if not (severity and lat is not None and lon is not None):
+        return {
+            "ok": False,
+            "error": "missing required fields for incident insert",
+            "vehicle_id": vehicle_id,
+            "event_type": event_type,
+            "severity": severity,
+            "lat": lat,
+            "lon": lon,
+            "location_saved": location_saved,
+            "location_error": location_err,
+        }
+
+    incident_id = payload.get("incident_id") or str(uuid.uuid4())
+
+    db_ok = False
+    try:
+        conn = _db_conn()
+        try:
+            with conn.cursor() as cur:
+                # NOTE: incidents.gps_speed will store simulator's raw speed (km/h) for now
+                cur.execute(
+                    INCIDENT_UPSERT_SQL,
+                    (
+                        incident_id,
+                        vehicle_id,
+                        event_type,
+                        severity,
+                        float(lon),  # PostGIS point: x=lon, y=lat
+                        float(lat),
+                        speed_kmh,
+                        engine_status,
+                        dtc_codes,
+                        eta_impact_min,
+                        requires_reorder,
+                        ts,
+                        ts,
+                    ),
+                )
+            conn.commit()
+            db_ok = True
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("INCIDENT_DB_CONNECT_OR_QUERY_FAILED")
+        return {
+            "ok": False,
+            "error": "db_failed",
+            "detail": f"{type(e).__name__}: {e}",
+            "vehicle_id": vehicle_id,
+            "event_type": event_type,
+            "severity": severity,
+            "incident_id": incident_id,
+            "location_saved": location_saved,
+            "location_error": location_err,
+        }
+
+    forward_event = {
+        "incident_id": incident_id,
+        "vehicle_id": vehicle_id,
+        "event_type": event_type,
+        "event_severity": severity,
+        "eta_impact_min": eta_impact_min,
+        "requires_reorder": requires_reorder,
+        "engine_status": engine_status,
+        "speed": speed_kmh,
+        "DTC_codes": dtc_codes,
+        "location": {"lat": float(lat), "lon": float(lon)},
+        "timestamp": ts,
+
+        # Extra fields (if simulator provides them)
+        "next_stop_id": payload.get("next_stop_id"),
+        "eta_to_next_stop_sec": payload.get("eta_to_next_stop_sec"),
+        "lateness_min": payload.get("lateness_min"),
+        "deviation_score": payload.get("deviation_score"),
+        "predicted_arrival": payload.get("predicted_arrival"),
+        "next_stop_window_start": payload.get("next_stop_window_start"),
+        "next_stop_window_end": payload.get("next_stop_window_end"),
+        "window_shift_days": payload.get("window_shift_days"),
+
+        "db_upsert_ok": db_ok,
+        "location_saved": location_saved,
+        "location_error": location_err,
+
+        "raw_payload": payload,
+    }
+    _forward_to_event_processor(forward_event, incident_id)
+
+    return {
+        "ok": True,
+        "incident_id": incident_id,
+        "vehicle_id": vehicle_id,
+        "event_type": event_type,
+        "severity": severity,
+        "eta_impact_min": eta_impact_min,
+        "requires_reorder": requires_reorder,
+        "location_saved": location_saved,
+        "location_error": location_err,
+    }
