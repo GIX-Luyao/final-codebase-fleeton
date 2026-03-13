@@ -1,4 +1,36 @@
 [![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/Z_kNVedj)
+
+# Fleeton - Real-Time Delivery Rerouting System
+
+Fleeton is an end-to-end delivery optimization system that detects delivery exceptions from real-time vehicle data and dynamically recalculates delivery routes to reduce delays and improve ETA reliability.
+
+## System Architecture
+
+- Backend: responsible for vehicle data ingestion, event detection, ETA impact analysis, and dynamic route recalculation.
+- Frontend: driver-facing application for real-time vehicle location, task list, alerts, and rerouting decisions.
+- Backend and Frontend communicate through HTTP APIs and long-polling.
+
+## Project Structure
+
+- `Backend - Lily/`: backend services, routing engine, and database-related modules.
+- `Frontend - Haichao/`: driver app frontend (React + TypeScript).
+- `README.md`: project overview and documentation entry point.
+
+## Frontend
+
+Frontend driver application responsible for:
+
+- visualizing vehicle telemetry and delivery stops
+- receiving backend event updates
+- displaying alerts and reroute suggestions
+- map-based route visualization
+
+Frontend implementation is located in:
+
+`Frontend - Haichao/`
+
+---
+
 # Backend
 
 ## Backend Architecture
